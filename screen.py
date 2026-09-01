@@ -2,13 +2,14 @@
 """
 screen.py - multi-sector quantitative stock screen for a ~2-year hold horizon.
 
-Pulls fundamentals and price history from Yahoo Finance (via yfinance), scores
+Pulls fundamentals and price history from Financial Modeling Prep (FMP), scores
 every ticker against a sector-specific weighting, and prints a ranked table per
 sector plus a diversified "Top 5".
 
 Usage
 -----
-    pip install yfinance
+    pip install -r requirements.txt        # just requests
+    export FMP_API_KEY=...                 # free key: 250 requests/day
     python screen.py                       # full screen, human-readable tables
     python screen.py --csv run.csv         # also write a flat CSV of every metric
     python screen.py --dump-json raw.json  # save the fetched metrics
@@ -29,20 +30,21 @@ Notes on the data
 * Every metric is optional. If a metric is missing, its component drops out of
   the score and the remaining weights are renormalized; the DATA column shows
   what fraction of the sector's weight was actually available.
+* FMP's free tier allows 250 requests/day. One screen of the default universe
+  costs about 110, and --max-requests caps what a run may spend.
 """
 
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
 import json
 import math
+import os
 import sys
 import time
-import warnings
-from datetime import datetime
-
-warnings.filterwarnings("ignore")
+from datetime import date, datetime
 
 # --------------------------------------------------------------------------
 # Configuration - edit freely, everything downstream is driven off these.
@@ -174,106 +176,350 @@ def slope_per_period(values):
 
 
 # --------------------------------------------------------------------------
-# Data fetching (yfinance). Everything here is best-effort: any field that
-# cannot be resolved comes back as None and is handled downstream.
+# Data fetching (Financial Modeling Prep). Everything here is best-effort: any
+# field that cannot be resolved comes back as None and is handled downstream.
 # --------------------------------------------------------------------------
 
-# Yahoo's row labels drift between tickers and filings, so each metric is
-# looked up through a list of candidates.
-ROW_ALIASES = {
-    "revenue": ["Total Revenue", "OperatingRevenue", "Operating Revenue", "Revenue"],
-    "gross_profit": ["Gross Profit"],
-    "cost_of_revenue": ["Cost Of Revenue", "Cost of Revenue", "Reconciled Cost Of Revenue"],
-    "total_debt": ["Total Debt", "TotalDebt"],
-    "long_term_debt": ["Long Term Debt", "Long Term Debt And Capital Lease Obligation"],
-    "current_debt": ["Current Debt", "Current Debt And Capital Lease Obligation"],
-    "equity": [
-        "Stockholders Equity",
-        "Total Stockholders Equity",
-        "Common Stock Equity",
-        "Total Equity Gross Minority Interest",
-    ],
-    "fcf": ["Free Cash Flow"],
-    "ocf": ["Operating Cash Flow", "Total Cash From Operating Activities"],
-    "capex": ["Capital Expenditure", "Capital Expenditures"],
-    "dividends_paid": ["Cash Dividends Paid", "Common Stock Dividend Paid", "Dividends Paid"],
+FMP_BASE_URL = os.environ.get(
+    "FMP_BASE_URL", "https://financialmodelingprep.com/api/v3"
+).rstrip("/")
+
+# FMP's public "demo" key answers for a handful of large caps (AAPL and
+# friends) and 403s on everything else - enough to smoke-test the plumbing,
+# not enough to run the screen. A free key allows 250 requests/day.
+DEMO_API_KEY = "demo"
+
+# Free tier: 250 requests/day. The screen spends one request per endpoint per
+# ticker, plus one price history per benchmark ETF, plus the odd annual-period
+# fallback when a quarterly statement is too short.
+DEFAULT_REQUEST_BUDGET = 250
+REQUESTS_PER_TICKER = 5          # income, ratios, cash flow, prices, quote
+ESTIMATES_REQUEST = 1            # analyst estimates, for forward P/E
+
+# Statement history to pull: 8 quarters is what the YoY revenue comparison and
+# the 4-quarter margin trend need.
+QUARTERS = 8
+
+# Years of daily closes to pull for the momentum window.
+PRICE_YEARS = 2
+
+# FMP spells the same quantity differently across endpoints and API revisions,
+# so each metric is looked up through a list of candidates rather than one
+# hard-coded field name.
+FIELD_ALIASES = {
+    "revenue": ["revenue"],
+    "gross_profit": ["grossProfit"],
+    "cost_of_revenue": ["costOfRevenue"],
+    # /ratios says grossProfitMargin, /income-statement says grossProfitRatio.
+    "gross_margin_ratio": ["grossProfitMargin", "grossProfitRatio"],
+    "debt_equity": ["debtEquityRatio", "debtToEquityRatio"],
+    "fcf": ["freeCashFlow"],
+    "ocf": ["operatingCashFlow", "netCashProvidedByOperatingActivities"],
+    "capex": ["capitalExpenditure"],
+    "dividends_paid": ["dividendsPaid", "commonDividendsPaid", "netDividendsPaid"],
+    "dividend_yield": ["dividendYield"],
+    "peg": ["priceEarningsToGrowthRatio", "priceToEarningsGrowthRatio"],
+    "price": ["price", "previousClose"],
+    "market_cap": ["marketCap", "mktCap"],
+    "shares": ["sharesOutstanding", "weightedAverageShsOut"],
+    "eps_estimate": ["estimatedEpsAvg", "epsAvg"],
 }
 
 
-def _row(df, key):
-    """Pull one row out of a yfinance statement, newest column first."""
-    if df is None or getattr(df, "empty", True):
-        return None
-    index_map = {str(i).strip().lower().replace(" ", ""): i for i in df.index}
-    for name in ROW_ALIASES[key]:
-        probe = name.strip().lower().replace(" ", "")
-        if probe in index_map:
-            series = df.loc[index_map[probe]]
-            if hasattr(series, "columns"):      # duplicated row label
-                series = series.iloc[0]
-            series = series.dropna()
+class FMPError(RuntimeError):
+    """Any FMP request that did not produce usable JSON."""
+
+
+class FMPAuthError(FMPError):
+    """401/403 - key missing, invalid, or the endpoint needs a paid plan."""
+
+
+class FMPRateLimit(FMPError):
+    """429 - burst or daily quota exhausted on FMP's side."""
+
+
+class FMPBudgetExhausted(FMPError):
+    """The local --max-requests budget is spent. Nothing was sent."""
+
+
+# Errors that mean "stop the run", not "skip this metric".
+FATAL_FMP_ERRORS = (FMPRateLimit, FMPBudgetExhausted)
+
+
+class FMPClient:
+    """Thin REST client: paces requests, retries, and caps the daily spend.
+
+    Every response is cached for the life of the run, so re-reading a
+    statement (or a benchmark's price history) is free.
+    """
+
+    def __init__(self, api_key, delay=0.3, budget=DEFAULT_REQUEST_BUDGET,
+                 timeout=20.0, retries=3, base_url=FMP_BASE_URL):
+        import requests
+
+        self.api_key = api_key or DEMO_API_KEY
+        self.delay = max(0.0, delay)
+        self.budget = budget
+        self.timeout = timeout
+        self.retries = max(1, retries)
+        self.base_url = base_url.rstrip("/")
+        self.requests_made = 0
+        self.skip_estimates = False
+        self.session = requests.Session()
+        self._cache = {}
+        self._last_call = 0.0
+
+    # -- plumbing ----------------------------------------------------------
+
+    def remaining(self):
+        return None if self.budget is None else max(0, self.budget - self.requests_made)
+
+    def _pace(self):
+        """Keep at least `delay` seconds between calls actually leaving here."""
+        if not self.delay:
+            return
+        wait = self.delay - (time.monotonic() - self._last_call)
+        if wait > 0:
+            time.sleep(wait)
+
+    def get(self, path, **params):
+        """GET one endpoint and return parsed JSON, memoized per run."""
+        key = (path, tuple(sorted(params.items())))
+        if key not in self._cache:
+            self._cache[key] = self._request(path, params)
+        return self._cache[key]
+
+    def _request(self, path, params):
+        import requests
+
+        if self.budget is not None and self.requests_made >= self.budget:
+            raise FMPBudgetExhausted(
+                f"local request budget of {self.budget} is spent "
+                "(raise it with --max-requests)"
+            )
+
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        query = dict(params)
+        query["apikey"] = self.api_key
+        backoff = 2.0            # network hiccups and 5xx
+        rate_backoff = 5.0       # 429s deserve a longer pause
+        last_error = None
+
+        for attempt in range(self.retries):
+            self._pace()
             try:
-                series = series.sort_index(ascending=False)
-            except Exception:
-                pass
-            return series
-    return None
+                resp = self.session.get(url, params=query, timeout=self.timeout)
+            except requests.RequestException as exc:
+                self._last_call = time.monotonic()
+                last_error = FMPError(f"{type(exc).__name__}: {exc}")
+                if attempt + 1 < self.retries:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                raise last_error
+            self._last_call = time.monotonic()
+            self.requests_made += 1     # a rejected call still costs quota
+
+            if resp.status_code == 429:
+                # Could be the per-second burst limit, which waiting clears, or
+                # the daily cap, which it does not. Back off a couple of times
+                # before giving up on the run.
+                last_error = FMPRateLimit("FMP returned 429 (rate limit)")
+                if attempt + 1 < self.retries:
+                    time.sleep(rate_backoff)
+                    rate_backoff *= 2
+                    continue
+                raise last_error
+            if resp.status_code in (401, 403):
+                raise FMPAuthError(
+                    f"HTTP {resp.status_code}: key rejected, or this endpoint is "
+                    "not on the plan"
+                )
+            if resp.status_code >= 500:
+                last_error = FMPError(f"HTTP {resp.status_code} from FMP")
+                if attempt + 1 < self.retries:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                raise last_error
+            if not resp.ok:
+                raise FMPError(f"HTTP {resp.status_code} for {path}")
+
+            try:
+                data = resp.json()
+            except ValueError:
+                raise FMPError(f"non-JSON response for {path}")
+
+            # FMP reports some failures with HTTP 200 and an error payload.
+            if isinstance(data, dict):
+                message = data.get("Error Message") or data.get("error")
+                if message:
+                    text = str(message)
+                    if "limit" in text.lower():
+                        raise FMPRateLimit(text[:200])
+                    raise FMPError(text[:200])
+            return data
+
+        raise last_error or FMPError(f"no response for {path}")
 
 
-def _vals(series, n=None):
-    """Row values as plain floats, newest first."""
-    if series is None:
-        return []
-    out = [_finite(v) for v in list(series.values)]
-    out = [v for v in out if v is not None]
+# --------------------------------------------------------------------------
+# Endpoint wrappers. Each returns a plain list of records, newest first, or an
+# empty list if FMP answered with something unexpected.
+# --------------------------------------------------------------------------
+
+
+def _records(payload):
+    return [r for r in payload if isinstance(r, dict)] if isinstance(payload, list) else []
+
+
+def fetch_income_statement(client, ticker, period="quarter", limit=QUARTERS):
+    return _records(client.get(f"income-statement/{ticker}", period=period, limit=limit))
+
+
+def fetch_ratios(client, ticker, period="quarter", limit=QUARTERS):
+    return _records(client.get(f"ratios/{ticker}", period=period, limit=limit))
+
+
+def fetch_cash_flow(client, ticker, period="quarter", limit=QUARTERS):
+    return _records(
+        client.get(f"cash-flow-statement/{ticker}", period=period, limit=limit)
+    )
+
+
+def fetch_quote(client, ticker):
+    rows = _records(client.get(f"quote/{ticker}"))
+    return rows[0] if rows else {}
+
+
+def fetch_analyst_estimates(client, ticker, limit=6):
+    return _records(
+        client.get(f"analyst-estimates/{ticker}", period="annual", limit=limit)
+    )
+
+
+# --------------------------------------------------------------------------
+# Record helpers
+# --------------------------------------------------------------------------
+
+
+def _field(record, key, default=None):
+    """First finite value for `key` among its FMP field aliases."""
+    if not isinstance(record, dict):
+        return default
+    for name in FIELD_ALIASES[key]:
+        if name in record:
+            value = _finite(record[name])
+            if value is not None:
+                return value
+    return default
+
+
+def _series(records, key, n=None):
+    """Values of `key` across statement records, newest first."""
+    out = []
+    for record in records or []:
+        value = _field(record, key)
+        if value is not None:
+            out.append(value)
     return out[:n] if n else out
 
 
-def _quarter_labels(series, n=None):
-    if series is None:
-        return []
-    labels = [str(getattr(c, "date", lambda: c)()) for c in series.index]
+def _period_labels(records, n=None):
+    labels = [
+        (record.get("date") if isinstance(record, dict) else None)
+        for record in records or []
+    ]
     return labels[:n] if n else labels
 
 
-def price_return(closes, months):
-    """Percent price return over the trailing `months`, or None if too short."""
-    import pandas as pd
+def _parse_date(text):
+    try:
+        return datetime.strptime(str(text)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
 
-    if closes is None or len(closes) < 2:
+
+def _shift_months(day, months):
+    """`day` moved back by whole calendar months, clamped to month length."""
+    month_index = day.month - 1 - months
+    year = day.year + month_index // 12
+    month = month_index % 12 + 1
+    last = calendar.monthrange(year, month)[1]
+    return date(year, month, min(day.day, last))
+
+
+def price_return(closes, months):
+    """Percent price return over the trailing `months`, or None if too short.
+
+    `closes` is a list of (date, close) pairs, oldest first.
+    """
+    if not closes or len(closes) < 2:
         return None
-    end_ts = closes.index[-1]
-    target = end_ts - pd.DateOffset(months=months)
-    earlier = closes.index[closes.index <= target]
-    if len(earlier) == 0:
+    end_day, end = closes[-1]
+    target = _shift_months(end_day, months)
+    earlier = [pair for pair in closes if pair[0] <= target]
+    if not earlier:
         return None
-    start_ts = earlier[-1]
+    start_day, start = earlier[-1]
     # Guard against a gappy history silently anchoring on a much older bar.
-    if (target - start_ts).days > 20:
+    if (target - start_day).days > 20:
         return None
-    start, end = _finite(closes.loc[start_ts]), _finite(closes.iloc[-1])
+    start, end = _finite(start), _finite(end)
     if not start or end is None:
         return None
     return (end / start - 1.0) * 100.0
 
 
-def fetch_close_series(ticker, period="2y"):
-    """Split-adjusted closing prices (not dividend-adjusted)."""
-    import yfinance as yf
+def fetch_close_series(client, ticker, years=PRICE_YEARS):
+    """Split-adjusted closing prices as (date, close), oldest first.
 
-    hist = yf.Ticker(ticker).history(period=period, auto_adjust=False)
-    if hist is None or hist.empty or "Close" not in hist.columns:
-        return None
-    closes = hist["Close"].dropna()
-    return closes if len(closes) else None
+    FMP's `close` is adjusted for splits but not for dividends, which is what
+    the screen wants: dividends are scored separately and must not be counted
+    twice. (`adjClose` is the total-return series - deliberately not used.)
+    """
+    today = datetime.now().date()
+    payload = client.get(
+        f"historical-price-full/{ticker}",
+        **{"from": _shift_months(today, 12 * years + 1).isoformat(),
+           "to": today.isoformat()},
+    )
+
+    rows = None
+    if isinstance(payload, dict):
+        rows = payload.get("historical")
+        if not rows:
+            # Batch shape: {"historicalStockList": [{"symbol": .., "historical": ..}]}
+            for entry in payload.get("historicalStockList") or []:
+                if str(entry.get("symbol", "")).upper() == ticker.upper():
+                    rows = entry.get("historical")
+                    break
+    elif isinstance(payload, list):
+        rows = payload
+
+    closes = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        day, close = _parse_date(row.get("date")), _finite(row.get("close"))
+        if day is not None and close is not None:
+            closes.append((day, close))
+    closes.sort(key=lambda pair: pair[0])       # FMP returns newest first
+    return closes or None
 
 
-def fetch_etf_returns(etfs, delay=0.0):
-    """{etf: {'ret_6m': x, 'ret_12m': y}} for the sector benchmarks."""
+def fetch_etf_returns(etfs, client):
+    """{etf: {'ret_6m': x, 'ret_12m': y}} for the sector benchmarks.
+
+    Doubles as the run's preflight: if every benchmark comes back rejected the
+    key cannot screen anything, so the caller is told once rather than watching
+    every ticker fail in turn.
+    """
     out = {}
+    rejected = 0
     for etf in etfs:
         try:
-            closes = fetch_close_series(etf)
+            closes = fetch_close_series(client, etf)
             out[etf] = {
                 "ret_6m": price_return(closes, 6),
                 "ret_12m": price_return(closes, 12),
@@ -281,18 +527,44 @@ def fetch_etf_returns(etfs, delay=0.0):
             if out[etf]["ret_12m"] is None:
                 print(f"  ! warning: no 12-month price history for benchmark {etf}",
                       file=sys.stderr)
+            continue
+        except FATAL_FMP_ERRORS:
+            raise
+        except FMPAuthError as exc:
+            rejected += 1
+            reason = exc
         except Exception as exc:
-            out[etf] = {"ret_6m": None, "ret_12m": None}
-            print(f"  ! warning: could not fetch benchmark {etf}: {exc}", file=sys.stderr)
-        if delay:
-            time.sleep(delay)
+            reason = exc
+        out[etf] = {"ret_6m": None, "ret_12m": None}
+        print(f"  ! warning: could not fetch benchmark {etf}: {reason}", file=sys.stderr)
+    if etfs and rejected == len(etfs):
+        raise FMPAuthError("every benchmark request was rejected")
     return out
 
 
-def fetch_ticker(ticker, sector, etf, etf_rets, delay=0.0):
-    """Collect every raw metric for one ticker. Never raises."""
-    import yfinance as yf
+def forward_pe_from_estimates(estimates, price):
+    """price / consensus EPS for the nearest fiscal year that has not closed."""
+    price = _finite(price)
+    if not price or not estimates:
+        return None
+    today = datetime.now().date()
+    dated = [(_parse_date(e.get("date")), e) for e in estimates]
+    dated = [(d, e) for d, e in dated if d is not None]
+    if not dated:
+        return None
+    # Sort on the date alone; two records sharing one would make Python try to
+    # order the dicts behind them.
+    future = sorted((pair for pair in dated if pair[0] >= today), key=lambda p: p[0])
+    candidate = future[0][1] if future else max(dated, key=lambda p: p[0])[1]
+    eps = _field(candidate, "eps_estimate")
+    if eps is None or eps <= 0:
+        return None
+    return price / eps
 
+
+def fetch_ticker(ticker, sector, etf, etf_rets, client, want_estimates=True):
+    """Collect every raw metric for one ticker. Never raises, except on the
+    fatal client errors that mean the rest of the run is pointless."""
     m = {
         "ticker": ticker,
         "sector": sector,
@@ -310,41 +582,37 @@ def fetch_ticker(ticker, sector, etf, etf_rets, delay=0.0):
     ):
         m[key] = None
 
-    try:
-        tk = yf.Ticker(ticker)
-    except Exception as exc:
-        m["failed"] = True
-        m["warnings"].append(f"could not open ticker: {exc}")
-        return m
-
     def guarded(label, fn, default=None):
         try:
             return fn()
+        except FATAL_FMP_ERRORS:
+            raise
+        except FMPAuthError as exc:
+            m["warnings"].append(f"{label} unavailable ({exc})")
+            return default
         except Exception as exc:
             m["warnings"].append(f"{label} unavailable ({type(exc).__name__})")
             return default
 
-    info = guarded("info", lambda: tk.info, {}) or {}
-    fast = guarded("fast_info", lambda: tk.fast_info, None)
+    # ---- quote: price, market cap, shares ---------------------------------
+    quote = guarded("quote", lambda: fetch_quote(client, ticker), {}) or {}
+    m["price"] = _field(quote, "price")
+    m["market_cap"] = _field(quote, "market_cap")
+    shares = _field(quote, "shares")
 
-    # ---- price, market cap ------------------------------------------------
-    closes = guarded("price history", lambda: fetch_close_series(ticker))
-    if closes is not None:
-        m["price"] = _finite(closes.iloc[-1])
+    # ---- price history ----------------------------------------------------
+    closes = guarded("price history", lambda: fetch_close_series(client, ticker))
+    if closes:
+        if m["price"] is None:
+            m["price"] = closes[-1][1]
         m["ret_6m"] = price_return(closes, 6)
         m["ret_12m"] = price_return(closes, 12)
     else:
         m["warnings"].append("no price history")
 
-    mc = None
-    for get in (lambda: fast["market_cap"], lambda: info.get("marketCap")):
-        try:
-            mc = _finite(get())
-        except Exception:
-            mc = None
-        if mc:
-            break
-    m["market_cap"] = mc
+    mc = m["market_cap"]
+    if mc is None and shares and m["price"]:
+        mc = m["market_cap"] = shares * m["price"]
 
     bench = etf_rets.get(etf, {})
     m["etf_ret_6m"], m["etf_ret_12m"] = bench.get("ret_6m"), bench.get("ret_12m")
@@ -352,15 +620,23 @@ def fetch_ticker(ticker, sector, etf, etf_rets, delay=0.0):
         m["excess_12m"] = m["ret_12m"] - m["etf_ret_12m"]
 
     # ---- statements -------------------------------------------------------
-    qis = guarded("quarterly income statement", lambda: tk.quarterly_income_stmt)
-    ais = guarded("annual income statement", lambda: tk.income_stmt)
-    qbs = guarded("quarterly balance sheet", lambda: tk.quarterly_balance_sheet)
-    qcf = guarded("quarterly cash flow", lambda: tk.quarterly_cashflow)
-    acf = guarded("annual cash flow", lambda: tk.cashflow)
+    qis = guarded("quarterly income statement",
+                  lambda: fetch_income_statement(client, ticker), [])
+    qratios = guarded("quarterly ratios", lambda: fetch_ratios(client, ticker), [])
+    qcf = guarded("quarterly cash flow", lambda: fetch_cash_flow(client, ticker), [])
+
+    # Annual statements cost another request each, so they are only pulled if
+    # a quarterly series turns out to be too short to work with.
+    annual = {}
+
+    def annual_records(kind, fetch):
+        if kind not in annual:
+            annual[kind] = guarded(f"annual {kind}", fetch, []) or []
+        return annual[kind]
 
     # ---- revenue growth YoY over the last 4 quarters ----------------------
-    q_rev = _vals(_row(qis, "revenue"))
-    q_rev_labels = _quarter_labels(_row(qis, "revenue"))
+    q_rev = _series(qis, "revenue")
+    q_rev_labels = _period_labels(qis)
     yoy = []
     if len(q_rev) >= 5:
         # Compare each of the last 4 quarters with the same quarter a year back.
@@ -379,7 +655,13 @@ def fetch_ticker(ticker, sector, etf, etf_rets, delay=0.0):
     else:
         # Not enough quarterly history for a YoY comparison - fall back to TTM
         # vs. the prior-year annual figure, then to annual-over-annual.
-        a_rev = _vals(_row(ais, "revenue"))
+        a_rev = _series(
+            annual_records(
+                "income statement",
+                lambda: fetch_income_statement(client, ticker, period="annual", limit=2),
+            ),
+            "revenue",
+        )
         if len(q_rev) >= 4 and a_rev:
             ttm = sum(q_rev[:4])
             if a_rev[0]:
@@ -392,19 +674,23 @@ def fetch_ticker(ticker, sector, etf, etf_rets, delay=0.0):
             m["warnings"].append("revenue growth unavailable")
 
     # ---- gross margin level and trend -------------------------------------
-    q_gp = _vals(_row(qis, "gross_profit"))
-    if not q_gp:
-        q_cor = _vals(_row(qis, "cost_of_revenue"))
-        if q_cor and q_rev:
-            q_gp = [r - c for r, c in zip(q_rev, q_cor)]
-    margins = []
-    for rev, gp in zip(q_rev[:4], q_gp[:4]):
-        if rev:
-            margins.append(gp / rev * 100.0)
+    # FMP reports margins as fractions on /ratios; fall back to the income
+    # statement (gross profit, or revenue less cost of revenue) if they are
+    # missing for this ticker.
+    margins = [r * 100.0 for r in _series(qratios, "gross_margin_ratio", 4)]
+    margin_labels = _period_labels(qratios, 4)
+    if not margins:
+        q_gp = _series(qis, "gross_profit")
+        if not q_gp:
+            q_cor = _series(qis, "cost_of_revenue")
+            if q_cor and q_rev:
+                q_gp = [r - c for r, c in zip(q_rev, q_cor)]
+        margins = [gp / rev * 100.0 for rev, gp in zip(q_rev[:4], q_gp[:4]) if rev]
+        margin_labels = q_rev_labels[:4]
     if margins:
         m["gross_margin"] = margins[0]
         m["gross_margin_quarters"] = [
-            {"quarter": q_rev_labels[i] if i < len(q_rev_labels) else None,
+            {"quarter": margin_labels[i] if i < len(margin_labels) else None,
              "gross_margin_pct": v}
             for i, v in enumerate(margins)
         ]
@@ -414,35 +700,38 @@ def fetch_ticker(ticker, sector, etf, etf_rets, delay=0.0):
         m["warnings"].append("gross margin unavailable")
 
     # ---- debt / equity ----------------------------------------------------
-    debt = _vals(_row(qbs, "total_debt"), 1)
-    if not debt:
-        lt = _vals(_row(qbs, "long_term_debt"), 1)
-        cur = _vals(_row(qbs, "current_debt"), 1)
-        if lt or cur:
-            debt = [(lt[0] if lt else 0.0) + (cur[0] if cur else 0.0)]
-    equity = _vals(_row(qbs, "equity"), 1)
-    if debt and equity and equity[0]:
-        m["debt_equity"] = debt[0] / equity[0]
-        m["debt_equity_basis"] = "latest quarterly balance sheet"
+    # FMP's debtEquityRatio is total debt over total stockholders' equity,
+    # which is the basis debt_equity_score's kink points assume.
+    de = _series(qratios, "debt_equity", 1)
+    if de:
+        m["debt_equity"] = de[0]
+        m["debt_equity_basis"] = "FMP ratios, latest quarter"
     else:
-        de_info = _finite(info.get("debtToEquity"))
-        if de_info is not None:
-            m["debt_equity"] = de_info / 100.0   # Yahoo reports this as a percent
-            m["debt_equity_basis"] = "info.debtToEquity"
+        de_annual = _series(
+            annual_records(
+                "ratios",
+                lambda: fetch_ratios(client, ticker, period="annual", limit=1),
+            ),
+            "debt_equity",
+            1,
+        )
+        if de_annual:
+            m["debt_equity"] = de_annual[0]
+            m["debt_equity_basis"] = "FMP ratios, latest fiscal year"
         else:
             m["warnings"].append("debt/equity unavailable")
-    if equity and equity[0] is not None and equity[0] < 0:
+    if m["debt_equity"] is not None and m["debt_equity"] < 0:
         m["warnings"].append("negative book equity")
 
     # ---- free cash flow (TTM) ---------------------------------------------
-    def fcf_from(df, n):
-        vals = _vals(_row(df, "fcf"), n)
+    def fcf_from(records, n):
+        vals = _series(records, "fcf", n)
         if len(vals) == n:
             return sum(vals)
-        ocf = _vals(_row(df, "ocf"), n)
-        capex = _vals(_row(df, "capex"), n)
+        ocf = _series(records, "ocf", n)
+        capex = _series(records, "capex", n)
         if len(ocf) == n and len(capex) == n:
-            # Yahoo signs capital expenditure negative.
+            # FMP signs capital expenditure negative.
             return sum(o - abs(c) for o, c in zip(ocf, capex))
         return None
 
@@ -450,54 +739,65 @@ def fetch_ticker(ticker, sector, etf, etf_rets, delay=0.0):
     if fcf is not None:
         m["fcf_ttm"], m["fcf_basis"] = fcf, "sum of last 4 quarters"
     else:
+        acf = annual_records(
+            "cash flow",
+            lambda: fetch_cash_flow(client, ticker, period="annual", limit=1),
+        )
         fcf = fcf_from(acf, 1)
         if fcf is not None:
             m["fcf_ttm"], m["fcf_basis"] = fcf, "most recent fiscal year"
         else:
-            fcf = _finite(info.get("freeCashflow"))
-            if fcf is not None:
-                m["fcf_ttm"], m["fcf_basis"] = fcf, "info.freeCashflow"
-            else:
-                m["warnings"].append("free cash flow unavailable")
+            m["warnings"].append("free cash flow unavailable")
     if m["fcf_ttm"] is not None and mc:
         m["fcf_yield"] = m["fcf_ttm"] / mc * 100.0
 
     # ---- dividend yield and coverage --------------------------------------
-    # Derived from the actual dividend history rather than info['dividendYield'],
-    # whose units have changed between yfinance releases.
-    div_ttm_ps = None
-    divs = guarded("dividend history", lambda: tk.dividends)
-    if divs is not None and len(divs):
-        try:
-            import pandas as pd
-
-            cutoff = pd.Timestamp.now(tz=divs.index.tz) - pd.DateOffset(months=12)
-            div_ttm_ps = _finite(divs[divs.index >= cutoff].sum())
-        except Exception:
-            div_ttm_ps = None
-    if div_ttm_ps is not None and m["price"]:
-        m["div_yield"] = div_ttm_ps / m["price"] * 100.0
-    else:
-        raw = _finite(info.get("dividendYield"))
-        if raw is not None:
-            # Older releases return a fraction, newer ones a percent.
-            m["div_yield"] = raw if raw > 1.0 else raw * 100.0
-
-    paid = _vals(_row(qcf, "dividends_paid"), 4)
+    # Cash actually paid out over the trailing four quarters, which gives both
+    # the yield (against market cap) and the free-cash-flow coverage.
+    paid = _series(qcf, "dividends_paid", 4)
     total_paid = abs(sum(paid)) if len(paid) == 4 else None
     if total_paid is None:
-        paid_a = _vals(_row(acf, "dividends_paid"), 1)
-        total_paid = abs(paid_a[0]) if paid_a else None
-    if total_paid is None and div_ttm_ps:
-        shares = _finite(info.get("sharesOutstanding"))
-        if shares:
-            total_paid = div_ttm_ps * shares
+        paid_annual = _series(
+            annual_records(
+                "cash flow",
+                lambda: fetch_cash_flow(client, ticker, period="annual", limit=1),
+            ),
+            "dividends_paid",
+            1,
+        )
+        total_paid = abs(paid_annual[0]) if paid_annual else None
+    if total_paid is not None and mc:
+        # A reported zero is a real 0% yield, not a missing one.
+        m["div_yield"] = total_paid / mc * 100.0
+    else:
+        # Fall back to the reported ratio. On quarterly records it is a
+        # quarterly yield, so four of them make the annual figure.
+        quarterly_yields = _series(qratios, "dividend_yield", 4)
+        if len(quarterly_yields) == 4:
+            m["div_yield"] = sum(quarterly_yields) * 100.0
     if m["fcf_ttm"] is not None and total_paid:
         m["div_coverage"] = m["fcf_ttm"] / total_paid
 
     # ---- valuation --------------------------------------------------------
-    m["forward_pe"] = _finite(info.get("forwardPE"))
-    m["peg"] = _finite(info.get("trailingPegRatio")) or _finite(info.get("pegRatio"))
+    # /quote carries a trailing P/E only, so the forward figure is priced off
+    # the analyst consensus for the current fiscal year. One extra request per
+    # ticker; --no-estimates turns it off, and a paywalled endpoint disables it
+    # for the rest of the run rather than failing every ticker.
+    if want_estimates and not client.skip_estimates:
+        try:
+            m["forward_pe"] = forward_pe_from_estimates(
+                fetch_analyst_estimates(client, ticker), m["price"]
+            )
+        except FATAL_FMP_ERRORS:
+            raise
+        except FMPAuthError:
+            client.skip_estimates = True
+            print("  ! warning: analyst estimates are not available on this API "
+                  "key - forward P/E will be blank", file=sys.stderr)
+        except Exception as exc:
+            m["warnings"].append(f"forward P/E unavailable ({type(exc).__name__})")
+    peg = _series(qratios, "peg", 1)
+    m["peg"] = peg[0] if peg else None
 
     core = [m["rev_yoy_avg"], m["gross_margin"], m["debt_equity"],
             m["fcf_ttm"], m["ret_12m"]]
@@ -505,8 +805,6 @@ def fetch_ticker(ticker, sector, etf, etf_rets, delay=0.0):
         m["failed"] = True
         m["warnings"].append("no usable data returned")
 
-    if delay:
-        time.sleep(delay)
     return m
 
 
@@ -828,9 +1126,21 @@ def main(argv=None):
                     help="only screen these sectors (exact names from SECTORS)")
     ap.add_argument("--tickers", nargs="+", metavar="SYM",
                     help="only screen these tickers")
+    ap.add_argument("--api-key", metavar="KEY",
+                    default=os.environ.get("FMP_API_KEY", DEMO_API_KEY),
+                    help="Financial Modeling Prep API key "
+                         "(default: $FMP_API_KEY, else FMP's 'demo' key)")
     ap.add_argument("--delay", type=float, default=0.3, metavar="SEC",
-                    help="pause between requests, to stay under Yahoo's rate limits "
-                         "(default: 0.3)")
+                    help="pause between FMP requests, to stay under the burst "
+                         "limit (default: 0.3)")
+    ap.add_argument("--max-requests", type=int, default=DEFAULT_REQUEST_BUDGET,
+                    metavar="N",
+                    help=f"stop the run after this many FMP requests, to protect "
+                         f"the daily quota (default: {DEFAULT_REQUEST_BUDGET}; "
+                         "0 for no cap)")
+    ap.add_argument("--no-estimates", action="store_true",
+                    help="skip the analyst-estimates call (saves one request per "
+                         "ticker; leaves forward P/E blank)")
     ap.add_argument("--components", action="store_true",
                     help="also print the per-component sub-scores")
     args = ap.parse_args(argv)
@@ -849,35 +1159,81 @@ def main(argv=None):
               "(no network access).")
     else:
         try:
-            import yfinance  # noqa: F401
+            import requests  # noqa: F401
         except ImportError:
-            print("yfinance is not installed. Run:  pip install yfinance",
+            print("requests is not installed. Run:  pip install -r requirements.txt",
                   file=sys.stderr)
             return 1
 
+        args.api_key = args.api_key or DEMO_API_KEY
+        if args.api_key == DEMO_API_KEY:
+            print("  ! warning: using FMP's shared 'demo' key, which only answers "
+                  "for a few sample symbols.\n"
+                  "    Get a free key (250 requests/day) at "
+                  "https://site.financialmodelingprep.com/developer/docs and pass "
+                  "it with\n    --api-key, or set FMP_API_KEY.", file=sys.stderr)
+
         etfs = sorted({etf for _, _, etf in work})
+        per_ticker = REQUESTS_PER_TICKER + (0 if args.no_estimates else ESTIMATES_REQUEST)
+        estimated = len(work) * per_ticker + len(etfs)
+        budget = args.max_requests if args.max_requests > 0 else None
+        client = FMPClient(args.api_key, delay=args.delay, budget=budget)
+
         print(f"Screening {len(work)} tickers across "
               f"{len({s for _, s, _ in work})} sectors "
               f"({datetime.now():%Y-%m-%d %H:%M}).")
+        print(f"Budgeting ~{estimated} FMP requests"
+              + (f" of {budget} allowed." if budget else "."))
+        if budget and estimated > budget:
+            print(f"  ! warning: this run needs about {estimated} requests but is "
+                  f"capped at {budget}; later tickers will be skipped.",
+                  file=sys.stderr)
         print(f"Fetching benchmarks: {', '.join(etfs)}")
-        etf_rets = fetch_etf_returns(etfs, delay=args.delay)
+        try:
+            etf_rets = fetch_etf_returns(etfs, client)
+        except FMPAuthError as exc:
+            print(f"FMP rejected this key: {exc}. "
+                  + ("The 'demo' key cannot screen this universe - get a free key "
+                     "at https://site.financialmodelingprep.com/developer/docs."
+                     if args.api_key == DEMO_API_KEY else
+                     "Check FMP_API_KEY / --api-key and the plan it is on."),
+                  file=sys.stderr)
+            return 1
 
         metrics = []
+        stopped = None
         for ticker, sector, etf in work:
+            if stopped:
+                metrics.append({"ticker": ticker, "sector": sector, "etf": etf,
+                                "failed": True, "warnings": [f"not fetched: {stopped}"]})
+                continue
             print(f"  fetching {ticker} ...", end=" ", flush=True)
             try:
-                m = fetch_ticker(ticker, sector, etf, etf_rets, delay=args.delay)
+                m = fetch_ticker(ticker, sector, etf, etf_rets, client,
+                                 want_estimates=not args.no_estimates)
+            except FATAL_FMP_ERRORS as exc:
+                # Out of quota - keep whatever was fetched and score that.
+                stopped = str(exc)
+                print("STOPPED")
+                print(f"  ! warning: stopping fetch after "
+                      f"{client.requests_made} requests - {exc}", file=sys.stderr)
+                m = {"ticker": ticker, "sector": sector, "etf": etf, "failed": True,
+                     "warnings": [f"not fetched: {stopped}"]}
             except Exception as exc:   # belt and braces; fetch_ticker guards too
                 m = {"ticker": ticker, "sector": sector, "etf": etf, "failed": True,
                      "warnings": [f"unhandled error: {type(exc).__name__}: {exc}"]}
             metrics.append(m)
             if m.get("failed"):
-                print("FAILED")
+                if not stopped:
+                    print("FAILED")
                 print(f"  ! warning: {ticker} could not be fetched - "
                       f"{'; '.join(m.get('warnings') or ['unknown reason'])}",
                       file=sys.stderr)
             else:
                 print("ok")
+
+        print(f"Used {client.requests_made} FMP request(s)"
+              + (f"; {client.remaining()} left in this run's budget." if budget else "."))
 
     for m in metrics:
         m.setdefault("warnings", [])
